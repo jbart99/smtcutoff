@@ -1,0 +1,521 @@
+---
+title: "SMT Data Challenge"
+author: "Jason Bartholomew"
+date: "2023-07-15"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#install.packages(c("dbplyr", "RSQLite"))
+
+Data frame setup for SQL
+```{r}
+library(readr)
+library(dplyr)
+
+makebig <- function(folder, first){
+bigdata <- read_csv(first)
+bigdata %>% mutate(Game = "abc")
+bigdata <- game_events[NULL, ]
+
+
+filelist <- list.files(path=".")
+for(i in filelist){
+  if(grepl(folder,i)){
+    current_df <- read_csv(i)
+    name <- gsub(paste0(folder,"-"),"",i)
+    name <- gsub(".csv","",name)
+    current_df %>% mutate(Game = name)
+    bigdata<- rbind(bigdata, current_df)
+  }
+}
+return(bigdata)
+}
+
+game_events <- makebig('game_events',"game_events-1900_01_TeamKJ_TeamB.csv")
+ball_pos <- makebig('ball_pos',"ball_pos-1900_01_TeamKJ_TeamB.csv")
+game_info <- makebig('game_info',"game_info-1900_01_TeamKJ_TeamB.csv")
+player_pos <- makebig('player_pos',"player_pos-1902_02_TeamMG_TeamA3.csv")
+```
+
+Set up SQL DB file
+```{r}
+library(DBI)
+library(RSQLite)
+
+smtdb <- dbConnect(RSQLite::SQLite(), "smtdb.sqlite")
+dbWriteTable(smtdb, "game_events", as.data.frame(game_events), overwrite = TRUE)
+dbWriteTable(smtdb, "player_pos", as.data.frame(player_pos), overwrite = TRUE)
+dbWriteTable(smtdb, "ball_pos", as.data.frame(ball_pos), overwrite = TRUE)
+dbWriteTable(smtdb, "game_info", as.data.frame(game_info), overwrite = TRUE)
+dbDisconnect(smtdb)
+```
+
+all_relays df for outside loop
+```{r}
+all_relays <- data.frame(
+  play_type = c("cut","cut","cut","cut","cut","cut","cut","cut","cut","cut","cut","cut","cut","cut","cut","cut","cut"),
+  play_info = c("9-4-6","9-4-5","9-6-5","9-6-2","9-3-2","8-4-6","8-6-4","8-6-5","8-4-5","8-6-2","8-4-2","8-5-2","8-3-2","7-6-4","7-6-2","7-6-5","7-5-2"),
+  player_of = c(9,9,9,9,9,8,8,8,8,8,8,8,8,7,7,7,7),
+  player_cut = c(4,4,6,6,3,4,6,6,4,6,4,5,3,6,6,6,5),
+  player_tag = c(6,5,5,2,2,6,4,5,5,2,2,2,2,4,2,5,2),
+  targetx2 = c(1,-63,-63,-1,-1,.5,.5,-63,-63,-1,-1,-1,-1,1,-1,-63,-1),
+  targety2 = c(127.5,63.5,63.5,1.5,1.5,127.5,127.5,63.5,63.5,1.5,1.5,1.5,1.5,127.5,1.5,63.5,1.5),
+  targetz2 = c(1.5,1.5,1.5,1.5,1.5,1.5,1.5,1.5,1.5,1.5,1.5,1.5,1.5,1.5,1.5,1.5,1.5)
+)
+
+```
+
+functions
+```{r}
+library(dplyr)
+
+pythagorean_3d <- function(a, b ,c){
+  hypotenuse_squared <- a^2 + b^2 + c^2
+  hypotenuse <- sqrt(hypotenuse_squared)
+  return(hypotenuse)
+}
+
+pythagorean_2d <- function(a, b){
+  hypotenuse_squared <- a^2 + b^2
+  hypotenuse <- sqrt(hypotenuse_squared)
+  return(hypotenuse)
+}
+
+pos_dictionary <- list(
+  "9" = "right_field",
+  "8" = "center_field",
+  "7" = "left_field",
+  "6" = "shortstop",
+  "5" = "third_base",
+  "4" = "second_base",
+  "3" = "first_base",
+  "2" = "catcher",
+  "1" = "pitcher"
+)
+
+read_player_pos <- function(posnum,row){
+  posnum_string <- as.character(posnum)
+  pos_string <- pos_dictionary[[posnum_string]]
+  thrower_id <- row[[pos_string]]
+  return(thrower_id)
+}
+
+#Throw angle
+calc_angle <- function(p1, p2, p3) {
+  # Calculate the vectors between points
+  v1 <- p1 - p2
+  v2 <- p3 - p2
+  #Calculate the dot product
+  dot_prod <- sum(v1 * v2)
+  
+  #Calculate the magnitudes of the vectors
+  mag_v1 <- sqrt(sum(v1^2))
+  mag_v2 <- sqrt(sum(v2^2))
+  
+  #Calculate the cosine of the angle
+  cosine_angle <- dot_prod / (mag_v1 * mag_v2)
+  
+  #Calculate the angle in radians using the inverse cosine (acos)
+  angle_rad <- acos(cosine_angle)
+  
+  #Convert radians to degrees
+  angle_deg <- angle_rad * (180 / pi)
+  
+  return(angle_deg)
+}
+```
+
+main double nested loop
+```{r}
+library(RSQLite)
+library(DBI)
+library(dplyr)
+#smtdb <- dbConnect(smtdb)
+#dbWriteTable(smtdb, "relay1", relay1, overwrite = TRUE)
+
+#Function to check if the desired sequence is present in the play
+check_sequence <- function(player_positions) {
+  #Check if the required positions are present in the play
+  all(required_positions %in% player_positions)
+}
+result_df <- data.frame()
+
+smtdb <- dbConnect(smtdb)
+#smtdb <- dbConnect(RSQLite::SQLite(), "smtdb.sqlite")
+
+for (j in 1:nrow(all_relays)){
+# Define the SQL query with multiple left joins
+
+required_positions <- c(as.character(all_relays$player_of[j]),as.character(all_relays$player_cut[j]),as.character(all_relays$player_tag[j]))  
+                        
+# Filter plays based on the desired sequence of player positions and get distinct combinations of gameID and Play_ID
+relay1 <- game_events %>%
+  group_by(game_str, play_id) %>%
+  filter(check_sequence(player_position)) %>%
+  ungroup()
+
+#smtdb <- dbConnect(RSQLite::SQLite(), "smtdb.sqlite")
+dbWriteTable(smtdb, "relay1", as.data.frame(relay1), overwrite = TRUE)
+  
+current_query <- paste0("
+    SELECT ge.*, bp.*, pp.*, gi.*
+    FROM relay1 AS ge
+    LEFT JOIN ball_pos AS bp ON ge.timestamp = bp.timestamp AND ge.game_str = bp.game_str
+    LEFT JOIN player_pos AS pp ON ge.timestamp = pp.timestamp AND ge.game_str = pp.game_str
+    LEFT JOIN game_info AS gi ON ge.game_str = gi.game_str AND ge.play_per_game = gi.play_per_game
+    WHERE pp.player_position IN ('", all_relays$player_of[j], "', '",
+                                all_relays$player_cut[j], "', '",
+                                all_relays$player_tag[j], "')
+")
+
+player_of <- all_relays$player_of[j]
+player_cut <- all_relays$player_cut[j]
+player_tag <- all_relays$player_tag[j]
+targetx2 <- all_relays$targetx2[j]
+targety2 <- all_relays$targety2[j]
+targetz2 <- all_relays$targetz2[j]
+play_type <- all_relays$play_type[j]
+play_info <- all_relays$play_info[j]
+#Execute the query and fetch the result
+
+joined_data <- dbGetQuery(smtdb, current_query)
+
+colnames(joined_data)[7] <- "player_position_a"
+joined_data <- joined_data[,-c(17)]
+joined_data <- joined_data[,-c(10)]
+each_play <- unique(joined_data[, c("game_str", "play_id")])
+
+#Loop through each unique combination
+for (i in 1:nrow(each_play)) {
+  tryCatch({
+  target_game_str <- each_play[i, "game_str"]
+  target_play_id <- each_play[i, "play_id"]
+
+throw1 <- joined_data %>%
+  filter(game_str == target_game_str, play_id == target_play_id, player_position_a == player_of, event_code == 3, player_position == player_cut)
+
+targetx <- throw1[["field_x"]]
+targety <- throw1[["field_y"]]
+targetz <- 4.5
+
+of1 <- joined_data %>%
+  filter(game_str == target_game_str, play_id == target_play_id, player_position_a == player_of, event_code == 3, player_position == player_of)
+
+throwerx <- of1[["field_x"]]
+throwery <- of1[["field_y"]]
+
+catch1 <- joined_data %>%
+  filter(game_str == target_game_str, play_id == target_play_id, player_position_a == player_cut, event_code == 2, player_position == player_cut)
+
+actualx <- catch1[["ball_position_x"]]
+actualy <- catch1[["ball_position_y"]]
+actualz <- catch1[["ball_position_z"]]
+
+cut1 <- joined_data %>%
+  filter(game_str == target_game_str, play_id == target_play_id, player_position_a == player_cut, event_code == 3, player_position == player_cut)
+
+throwerx2 <- cut1[["field_x"]]
+throwery2 <- cut1[["field_y"]]
+catch2 <- joined_data %>%
+  filter(game_str == target_game_str, play_id == target_play_id, player_position_a == player_tag, event_code == 2, player_position == player_tag)
+
+actualx2 <- catch2[["ball_position_x"]]
+actualy2 <- catch2[["ball_position_y"]]
+actualz2 <- catch2[["ball_position_z"]]
+
+miss1 <- pythagorean_3d((actualx - targetx),(actualy - targety),(actualz - targetz))
+
+miss2 <- pythagorean_3d((actualx2 - targetx2),(actualy2 - targety2),(actualz2 - targetz2))
+
+target_coor <- c(targetx, targety)
+thrower_coor <- c(throwerx, throwery)
+actual_coor <- c(actualx, actualy)
+
+target_coor2 <- c(targetx2, targety2)
+thrower_coor2 <- c(throwerx2, throwery2)
+actual_coor2 <- c(actualx2, actualy2)
+
+throw1_angle <- calc_angle(target_coor, thrower_coor, actual_coor)
+throw2_angle <- calc_angle(target_coor2, thrower_coor2, actual_coor2)
+
+total_distance <- pythagorean_2d((throwerx - targetx2),(throwery - targety2))
+total_speed <- total_distance / ((catch2[["timestamp"]] - throw1[["timestamp"]])/1000)
+
+throw1_distance <- pythagorean_2d((throwerx - targetx),(throwery - targety))
+throw1_speed <- throw1_distance / ((catch1[["timestamp"]] - throw1[["timestamp"]])/1000)
+throw1_accuracy <- (30 - abs(throw1_angle)) / 30
+throw1_efficiency <- throw1_speed - miss2
+
+throw2_distance <- pythagorean_2d((throwerx2 - targetx2),(throwery2 - targety2))
+throw2_speed <- throw2_distance / ((catch2[["timestamp"]] - cut1[["timestamp"]])/1000)
+throw2_accuracy <- (30 - abs(throw2_angle)) / 30
+throw2_efficiency <- throw2_speed - (2 * miss2)
+
+first_instance_row <- which(joined_data$game_str == target_game_str & joined_data$play_id == target_play_id)[1]
+
+thrower_id <- read_player_pos(player_of,joined_data[first_instance_row,])
+cut_id <- read_player_pos(player_cut,joined_data[first_instance_row,])
+
+result_df_add <- data.frame(
+  play_type = play_type,
+  play_info = play_info,
+  of_id = thrower_id,
+  cut_id = cut_id,
+  game_id = target_game_str,
+  play_id = target_play_id,
+  throwfull_distance = total_distance,
+  throwfull_speed = total_speed,
+  throwfull_angle = throw2_angle,
+  throwfull_miss = miss2,
+  throwfull_accuracy = ((1 + throw2_accuracy) / 2),
+  throwfull_efficiency = total_speed - (2 * miss2),
+  throw1_distance = throw1_distance,
+  throw1_speed = throw1_speed,
+  throw1_angle = throw1_angle,
+  throw1_miss = miss1,
+  throw1_accuracy = throw1_accuracy,
+  throw1_efficiency = throw1_efficiency,
+  throw2_distance = throw2_distance,
+  throw2_speed = throw2_speed,
+  throw2_angle = throw2_angle,
+  throw2_miss = miss2,
+  throw2_accuracy = throw2_accuracy,
+  throw2_efficiency = throw2_efficiency
+)
+
+result_df <- rbind(result_df, result_df_add)
+
+  }, error = function(e){
+    cat("Error in", i, ":", conditionMessage(e), "\n")
+  })
+}
+
+}
+#Close the database connection
+dbDisconnect(smtdb)
+```
+
+```{r}
+new_result_df <- result_df[!duplicated(result_df),]
+```
+
+```{r}
+total_plays <- unique(game_events[, c("game_str", "play_id")])
+View(total_plays)
+
+total_games <- unique(game_events[, c("game_str")])
+View(total_games)
+```
+
+dataframe for all straight-through rows
+```{r}
+all_throws <- data.frame(
+  play_type = c("full","full","full","full","full","full","full","full","full","full","full","full"),
+  play_info = c("9-4","9-6","9-5","9-2","8-4","8-6","8-5","8-2","7-6","7-4","7-5","7-2"),
+  player_of = c(9,9,9,9,8,8,8,8,7,7,7,7),
+  player_cut = c(NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA),
+  player_tag = c(4,6,5,2,4,6,5,2,6,4,5,2),
+  targetx2 = c(1,1,-63,-1,.5,.5,-63,-1,1,1,-63,-1),
+  targety2 = c(127.5,127.5,63.5,1.5,127.5,127.5,63.5,1.5,127.5,127.5,63.5,1.5),
+  targetz2 = c(1.5,1.5,1.5,1.5,1.5,1.5,1.5,1.5,1.5,1.5,1.5,1.5)
+)
+```
+
+Gathering all straight through
+```{r}
+library(RSQLite)
+library(DBI)
+library(dplyr)
+
+#Function to check if the desired sequence is present in the play
+check_sequence <- function(player_positions) {
+  #Check if the required positions are present in the play
+  all(required_positions %in% player_positions)
+}
+
+smtdb <- dbConnect(smtdb)
+#smtdb <- dbConnect(RSQLite::SQLite(), "smtdb.sqlite")
+
+for (j in 1:nrow(all_throws)){
+#Define the SQL query with multiple left joins
+
+required_positions <- c(as.character(all_throws$player_of[j]),as.character(all_throws$player_tag[j]))  
+                        
+#Filter plays based on the desired sequence of player positions and get distinct combinations of gameID and Play_ID
+relay1 <- game_events %>%
+  group_by(game_str, play_id) %>%
+  filter(check_sequence(player_position)) %>%
+  ungroup()
+
+#smtdb <- dbConnect(RSQLite::SQLite(), "smtdb.sqlite")
+dbWriteTable(smtdb, "relay1", as.data.frame(relay1), overwrite = TRUE)
+  
+current_query <- paste0("
+    SELECT ge.*, bp.*, pp.*, gi.*
+    FROM relay1 AS ge
+    LEFT JOIN ball_pos AS bp ON ge.timestamp = bp.timestamp AND ge.game_str = bp.game_str
+    LEFT JOIN player_pos AS pp ON ge.timestamp = pp.timestamp AND ge.game_str = pp.game_str
+    LEFT JOIN game_info AS gi ON ge.game_str = gi.game_str AND ge.play_per_game = gi.play_per_game
+    WHERE pp.player_position IN ('", all_throws$player_of[j], "', '",
+                                all_throws$player_tag[j], "')
+")
+
+player_of <- all_throws$player_of[j]
+player_tag <- all_throws$player_tag[j]
+targetx2 <- all_throws$targetx2[j]
+targety2 <- all_throws$targety2[j]
+targetz2 <- all_throws$targetz2[j]
+play_type <- all_throws$play_type[j]
+play_info <- all_throws$play_info[j]
+
+#Execute the query and fetch the result
+
+joined_data <- dbGetQuery(smtdb, current_query)
+
+colnames(joined_data)[7] <- "player_position_a"
+joined_data <- joined_data[,-c(17)]
+joined_data <- joined_data[,-c(10)]
+each_play <- unique(joined_data[, c("game_str", "play_id")])
+
+# Loop through each unique combination
+for (i in 1:nrow(each_play)) {
+  tryCatch({
+  target_game_str <- each_play[i, "game_str"]
+  target_play_id <- each_play[i, "play_id"]
+
+throw1 <- joined_data %>%
+  filter(game_str == target_game_str, play_id == target_play_id, player_position_a == player_of, event_code == 3, player_position == player_of)
+
+of1 <- joined_data %>%
+  filter(game_str == target_game_str, play_id == target_play_id, player_position_a == player_of, event_code == 3, player_position == player_of)
+
+throwerx <- of1[["field_x"]]
+throwery <- of1[["field_y"]]
+
+catch2 <- joined_data %>%
+  filter(game_str == target_game_str, play_id == target_play_id, player_position_a == player_tag, event_code == 2, player_position == player_tag)
+
+actualx2 <- catch2[["ball_position_x"]]
+actualy2 <- catch2[["ball_position_y"]]
+actualz2 <- catch2[["ball_position_z"]]
+
+miss2 <- pythagorean_3d((actualx2 - targetx2),(actualy2 - targety2),(actualz2 - targetz2))
+
+thrower_coor <- c(throwerx, throwery)
+target_coor2 <- c(targetx2, targety2)
+actual_coor2 <- c(actualx2, actualy2)
+
+throw1_angle <- calc_angle(target_coor2, thrower_coor, actual_coor2)
+
+total_distance <- pythagorean_2d((throwerx - targetx2),(throwery - targety2))
+total_speed <- total_distance / ((catch2[["timestamp"]] - throw1[["timestamp"]])/1000)
+throw1_accuracy <- (30 - abs(throw1_angle)) / 30
+
+first_instance_row <- which(joined_data$game_str == target_game_str & joined_data$play_id == target_play_id)[1]
+
+thrower_id <- read_player_pos(player_of,joined_data[first_instance_row,])
+
+result_df_add <- data.frame(
+  play_type = play_type,
+  play_info = play_info,
+  of_id = thrower_id,
+  cut_id = NA,
+  game_id = target_game_str,
+  play_id = target_play_id,
+  throwfull_distance = total_distance,
+  throwfull_speed = total_speed,
+  throwfull_angle = throw1_angle,
+  throwfull_miss = miss2,
+  throwfull_accuracy = throw1_accuracy,
+  throwfull_efficiency = total_speed - (2 * miss2),
+  throw1_distance = NA,
+  throw1_speed = NA,
+  throw1_angle = NA,
+  throw1_miss = NA,
+  throw1_accuracy = NA,
+  throw1_efficiency = NA,
+  throw2_distance = NA,
+  throw2_speed = NA,
+  throw2_angle = NA,
+  throw2_miss = NA,
+  throw2_accuracy = NA,
+  throw2_efficiency = NA
+)
+
+result_df <- rbind(result_df, result_df_add)
+
+  }, error = function(e){
+    cat("Error in", i, ":", conditionMessage(e), "\n")
+  })
+}
+
+}
+# Close the database connection
+dbDisconnect(smtdb)
+```
+
+```{r}
+result_df_clean <- result_df[result_df$throwfull_miss <= 15, ]
+result_df_clean <- result_df_clean[result_df_clean$throwfull_efficiency >= 0, ]
+result_df_clean <- result_df_clean[result_df_clean$throwfull_speed >= 60, ]
+#result_df_clean <- result_df_clean[result_df_clean$of_id == 3036, ]
+
+result_df_clean <- result_df_clean %>%
+  arrange(game_id, play_id) %>%  
+  group_by(game_id, play_id) %>%  
+  filter(!(play_type == "full" & any(play_type == "cut"))) %>%  
+  ungroup()  
+
+library(ggplot2)
+library(dplyr)
+
+plot_full <- ggplot(result_df_clean %>% filter(play_type == "full"), aes(throwfull_distance, throwfull_efficiency)) +
+  geom_point(size = 2, shape = 17) +
+  geom_smooth(method = "lm", formula = y ~ poly(x, 2), se = FALSE, color = "blue") +  # Add quadratic best fit line
+  labs(title = "Scatter Plot for Play Type 'Full'",
+       x = "Throwfull Distance",
+       y = "Throwfull Efficiency") +
+  coord_fixed()  # Set equal dimensions
+
+plot_cut <- ggplot(result_df_clean %>% filter(play_type == "cut"), aes(throwfull_distance, throwfull_efficiency)) +
+  geom_point(size = 2, shape = 16) +
+  geom_smooth(method = "lm", formula = y ~ poly(x, 2), se = FALSE, color = "red") +  # Add quadratic best fit line
+  labs(title = "Scatter Plot for Play Type 'Cut'",
+       x = "Throwfull Distance",
+       y = "Throwfull Efficiency") +
+  coord_fixed()  # Set equal dimensions
+
+full_data <- result_df_clean %>% filter(play_type == "full")
+cut_data <- result_df_clean %>% filter(play_type == "cut")
+
+# Create combined plot with quadratic best fit lines for "full" and "cut"
+plot_combined <- ggplot(result_df_clean, aes(throwfull_distance, throwfull_efficiency, shape = play_type, color = play_type)) +
+  geom_point(size = 2) +
+  geom_smooth(data = result_df_clean %>% filter(play_type == "full"), method = "lm", formula = y ~ poly(x, 2), se = FALSE, color = "blue") +
+  geom_smooth(data = result_df_clean %>% filter(play_type == "cut"), method = "lm", formula = y ~ poly(x, 2), se = FALSE, color = "red") +
+  labs(title = "Scatter Plot with Different Markers and Quadratic Best Fit Lines",
+       x = "Throwfull Distance",
+       y = "Throwfull Efficiency") +
+  scale_shape_manual(values = c("cut" = 16, "full" = 17)) +
+  scale_color_manual(values = c("cut" = "red", "full" = "blue")) +
+  coord_fixed()  # Set equal dimensions
+
+
+# Print the plots
+print(plot_full)
+print(plot_cut)
+print(plot_combined)
+
+#ggsave("plot_full.png", plot = plot_full, width = 6, height = 4, dpi = 300)
+#ggsave("plot_cut.png", plot = plot_cut, width = 6, height = 4, dpi = 300)
+#ggsave("plot_combined.png", plot = plot_combined, width = 6, height = 4, dpi = 300)
+
+# Save the intersection point to a CSV file
+#write.csv(result_df_clean, "results.csv", row.names = FALSE)
+```
